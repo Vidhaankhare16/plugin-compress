@@ -125,6 +125,46 @@ class ArchiveCompressDirectoryTest {
     }
 
     @Test
+    void workingDirectoryPathWithSpaces() throws Exception {
+        ArchiveCompress task = task(ArchiveDecompress.ArchiveAlgorithm.ZIP, null).fromDirectory(Property.ofValue("my data")).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Path root = runContext.workingDir().path().resolve("my data");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("a b.txt"), "a");
+
+        Map<String, String> files = read(task.run(runContext), ArchiveDecompress.ArchiveAlgorithm.ZIP, null, runContext);
+
+        assertThat(files.keySet(), containsInAnyOrder("a b.txt"));
+    }
+
+    @Test
+    void duplicateEntryBetweenFromAndFromDirectoryIsRejected() throws Exception {
+        URI f1 = compressUtils.uploadToStorageString("map");
+        ArchiveCompress task = task(ArchiveDecompress.ArchiveAlgorithm.TAR, null)
+            .fromDirectory(Property.ofValue("data"))
+            .from(Map.of("a.txt", f1.toString()))
+            .build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Path root = runContext.workingDir().path().resolve("data");
+        Files.createDirectories(root);
+        Files.writeString(root.resolve("a.txt"), "a");
+
+        Exception exception = assertThrows(Exception.class, () -> task.run(runContext));
+        assertThat(exception.getMessage(), containsString("Duplicate archive entry `a.txt`"));
+    }
+
+    @Test
+    void emptyFromDirectoryIsRejected() throws Exception {
+        ArchiveCompress task = task(ArchiveDecompress.ArchiveAlgorithm.ZIP, null).fromDirectory(Property.ofValue(" ")).build();
+        RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+
+        Exception exception = assertThrows(IllegalArgumentException.class, () -> task.run(runContext));
+        assertThat(exception.getMessage(), containsString("must not be empty"));
+    }
+
+    @Test
     void requiresFromOrFromDirectory() throws Exception {
         ArchiveCompress task = task(ArchiveDecompress.ArchiveAlgorithm.ZIP, null).build();
         RunContext runContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());

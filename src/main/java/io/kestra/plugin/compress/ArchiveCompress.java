@@ -8,9 +8,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -147,6 +149,7 @@ import static io.kestra.core.utils.Rethrow.throwConsumer;
 )
 public class ArchiveCompress extends AbstractArchive implements RunnableTask<ArchiveCompress.Output>, Data.From {
     // /my/namespace/_files/some/dir: the internal storage location of the files of the namespace my.namespace
+    private static final Pattern SCHEME_PREFIX = Pattern.compile("^[a-zA-Z][a-zA-Z0-9+.-]+://");
     private static final Pattern NAMESPACE_FILES_PATH = Pattern.compile("^/(.+?)/_files(?:/(.*))?$");
 
     @Schema(
@@ -164,7 +167,7 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
             - a namespace directory given as its internal storage URI, e.g. `kestra:///my/namespace/_files/path/to/dir`, handled like `nsfile://`;
             - any other directory of Kestra's internal storage, e.g. a `kestra:///...` execution output directory, whose stored files are archived as they are;
             - a path inside the task working directory, e.g. `my/dir` (symbolic links are skipped).
-            Can be combined with `from`: the directory content is written first, then the `from` entries."""
+            Can be combined with `from`: the directory content is written first, then the `from` entries, and a `from` entry named like a file of the directory is rejected."""
     )
     @PluginProperty(group = "main")
     private Property<String> fromDirectory;
@@ -201,9 +204,12 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
 
     @SuppressWarnings("unchecked")
     private void writeArchive(RunContext runContext, ArchiveOutputStream archiveInputStream) throws Exception {
+        Set<String> writtenNames = new HashSet<>();
+
         if (this.fromDirectory != null) {
-            String directory = runContext.render(this.fromDirectory).as(String.class).orElseThrow();
-            this.writeDirectory(runContext, archiveInputStream, directory);
+            String directory = runContext.render(this.fromDirectory).as(String.class).filter(d -> !d.isBlank())
+                .orElseThrow(() -> new IllegalArgumentException("`fromDirectory` must not be empty"));
+            writtenNames.addAll(this.writeDirectory(runContext, archiveInputStream, directory));
         }
 
         if (this.from != null) {
@@ -216,6 +222,9 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
 
                         // temp file and path
                         String finalPath = runContext.render(current.getKey());
+                        if (writtenNames.contains(finalPath)) {
+                            throw new IllegalArgumentException("Duplicate archive entry `" + finalPath + "`: it is already added by `fromDirectory`");
+                        }
                         File tempFile = runContext.workingDir().resolve(Path.of(finalPath)).toFile();
                         new File(tempFile.getParent()).mkdirs();
 
@@ -253,11 +262,12 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
     private record DirectoryItem(String name, boolean directory, Path localPath, URI storageUri) {
     }
 
-    private void writeDirectory(RunContext runContext, ArchiveOutputStream archive, String directory) throws Exception {
+    private Set<String> writeDirectory(RunContext runContext, ArchiveOutputStream archive, String directory) throws Exception {
         boolean directoriesSupported = runContext.render(this.algorithm).as(ArchiveAlgorithm.class).orElseThrow() != ArchiveAlgorithm.AR;
 
         List<DirectoryItem> items = this.listDirectory(runContext, directory);
         items.sort(Comparator.comparing(DirectoryItem::name));
+        Set<String> names = new HashSet<>();
 
         for (DirectoryItem item : items) {
             if (item.directory()) {
@@ -274,6 +284,7 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
                 continue;
             }
 
+            names.add(item.name());
             Path file = item.localPath();
             boolean temporary = file == null;
             if (temporary) {
@@ -295,11 +306,15 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
                 }
             }
         }
+
+        return names;
     }
 
     private List<DirectoryItem> listDirectory(RunContext runContext, String directory) throws Exception {
-        URI uri = URI.create(directory);
-        String scheme = uri.getScheme();
+        // only a `scheme://` value is a URI: anything else is a working directory path, which may hold spaces or backslashes
+        Matcher schemeMatcher = SCHEME_PREFIX.matcher(directory);
+        URI uri = schemeMatcher.find() ? URI.create(directory) : null;
+        String scheme = uri == null ? null : uri.getScheme();
 
         if (Namespace.NAMESPACE_FILE_SCHEME.equals(scheme)) {
             return this.listNamespaceDirectory(runContext, uri.getAuthority(), uri.getPath());
@@ -313,8 +328,7 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
             List<DirectoryItem> items = new ArrayList<>();
             this.listStorageDirectory(runContext, uri, "", items);
             return items;
-        } else if (scheme != null && scheme.length() > 1) {
-            // a one letter scheme is a Windows drive letter, anything else is not a supported location
+        } else if (scheme != null) {
             throw new IllegalArgumentException("Scheme not supported: " + scheme + ". `fromDirectory` supports `nsfile://`, `kestra://` and working directory paths");
         }
 
