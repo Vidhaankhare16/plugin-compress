@@ -3,8 +3,17 @@ package io.kestra.plugin.compress;
 import java.io.*;
 import java.net.URI;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.apache.commons.compress.archivers.ArchiveEntry;
 import org.apache.commons.compress.archivers.ArchiveOutputStream;
@@ -13,19 +22,23 @@ import org.apache.commons.io.IOUtils;
 
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.annotations.PluginProperty;
+import io.kestra.core.models.namespaces.files.NamespaceFileMetadata;
 import io.kestra.core.models.property.Data;
+import io.kestra.core.models.property.Property;
 import io.kestra.core.models.property.URIFetcher;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.storages.FileAttributes;
+import io.kestra.core.storages.Namespace;
+import io.kestra.core.storages.StorageContext;
 
 import io.swagger.v3.oas.annotations.media.Schema;
-import jakarta.validation.constraints.NotNull;
 import lombok.*;
 import lombok.experimental.SuperBuilder;
 import reactor.core.scheduler.Schedulers;
 
 import static io.kestra.core.utils.Rethrow.throwConsumer;
-import io.kestra.core.models.annotations.PluginProperty;
 
 @SuperBuilder
 @ToString
@@ -33,8 +46,8 @@ import io.kestra.core.models.annotations.PluginProperty;
 @Getter
 @NoArgsConstructor
 @Schema(
-    title = "Create an archive from multiple files",
-    description = "Builds an archive from rendered file map inputs stored in internal storage, optionally wrapping it with a stream compressor (for example TAR + GZIP). Fails for algorithms that are extract-only."
+    title = "Create an archive from multiple files or a directory",
+    description = "Builds an archive from rendered file map inputs stored in internal storage and/or from a whole directory walked recursively with relative paths preserved, optionally wrapping it with a stream compressor (for example TAR + GZIP). Fails for algorithms that are extract-only."
 )
 @Plugin(
     examples = {
@@ -90,19 +103,77 @@ import io.kestra.core.models.annotations.PluginProperty;
                     from: "{{ outputs.archive_compress.uri }}"
                     key: "archive.gz"
                 """
+        ),
+        @Example(
+            full = true,
+            title = "Compress a whole namespace directory, preserving relative paths",
+            code = """
+                id: archive_compress_directory
+                namespace: company.team
+
+                tasks:
+                  - id: archive_compress
+                    type: "io.kestra.plugin.compress.ArchiveCompress"
+                    fromDirectory: "nsfile:///reports"
+                    algorithm: ZIP
+                """
+        ),
+        @Example(
+            full = true,
+            title = "Compress a directory of the task working directory",
+            code = """
+                id: archive_compress_working_directory
+                namespace: company.team
+
+                tasks:
+                  - id: working_dir
+                    type: io.kestra.plugin.core.flow.WorkingDirectory
+                    tasks:
+                      - id: generate
+                        type: io.kestra.plugin.scripts.shell.Commands
+                        taskRunner:
+                          type: io.kestra.plugin.core.runner.Process
+                        commands:
+                          - mkdir -p data/nested && echo hello > data/nested/a.txt
+
+                      - id: archive_compress
+                        type: "io.kestra.plugin.compress.ArchiveCompress"
+                        fromDirectory: "data"
+                        algorithm: TAR
+                        compression: GZIP
+                """
         )
     }
 )
 public class ArchiveCompress extends AbstractArchive implements RunnableTask<ArchiveCompress.Output>, Data.From {
+    // /my/namespace/_files/some/dir: the internal storage location of the files of the namespace my.namespace
+    private static final Pattern NAMESPACE_FILES_PATH = Pattern.compile("^/(.+?)/_files(?:/(.*))?$");
+
     @Schema(
         title = Data.From.TITLE,
-        description = Data.From.DESCRIPTION
+        description = Data.From.DESCRIPTION + " Optional when `fromDirectory` is set."
     )
-    @NotNull
     @PluginProperty(group = "main")
     private Object from;
 
+    @Schema(
+        title = "Directory to archive recursively",
+        description = """
+            Every file below this directory is added to the archive with its path relative to the directory root, and directories (including empty ones) are added as entries, except for the AR format which has no directory support. Supported locations:
+            - a namespace directory, e.g. `nsfile:///path/to/dir` (current namespace) or `nsfile://my.namespace/path/to/dir`;
+            - a namespace directory given as its internal storage URI, e.g. `kestra:///my/namespace/_files/path/to/dir`, handled like `nsfile://`;
+            - any other directory of Kestra's internal storage, e.g. a `kestra:///...` execution output directory, whose stored files are archived as they are;
+            - a path inside the task working directory, e.g. `my/dir` (symbolic links are skipped).
+            Can be combined with `from`: the directory content is written first, then the `from` entries."""
+    )
+    @PluginProperty(group = "main")
+    private Property<String> fromDirectory;
+
     public Output run(RunContext runContext) throws Exception {
+        if (this.from == null && this.fromDirectory == null) {
+            throw new IllegalArgumentException("At least one of `from` or `fromDirectory` must be set");
+        }
+
         File tempFile = runContext.workingDir().createTempFile().toFile();
 
         try (BufferedOutputStream outputStream = new BufferedOutputStream(new FileOutputStream(tempFile))) {
@@ -130,41 +201,188 @@ public class ArchiveCompress extends AbstractArchive implements RunnableTask<Arc
 
     @SuppressWarnings("unchecked")
     private void writeArchive(RunContext runContext, ArchiveOutputStream archiveInputStream) throws Exception {
-        Data.from(this.from)
-            .read(runContext)
-            .publishOn(Schedulers.boundedElastic())
-            .doOnNext(throwConsumer(map ->
-            {
-                for (Map.Entry<String, Object> current : map.entrySet()) {
+        if (this.fromDirectory != null) {
+            String directory = runContext.render(this.fromDirectory).as(String.class).orElseThrow();
+            this.writeDirectory(runContext, archiveInputStream, directory);
+        }
 
-                    // temp file and path
-                    String finalPath = runContext.render(current.getKey());
-                    File tempFile = runContext.workingDir().resolve(Path.of(finalPath)).toFile();
-                    new File(tempFile.getParent()).mkdirs();
+        if (this.from != null) {
+            Data.from(this.from)
+                .read(runContext)
+                .publishOn(Schedulers.boundedElastic())
+                .doOnNext(throwConsumer(map ->
+                {
+                    for (Map.Entry<String, Object> current : map.entrySet()) {
 
-                    // write to temp file
-                    String render = runContext.render(current.getValue().toString());
-                    OutputStream fileOutputStream = new BufferedOutputStream(new FileOutputStream(tempFile));
-                    InputStream inputStream = URIFetcher.of(URI.create(render)).fetch(runContext);
+                        // temp file and path
+                        String finalPath = runContext.render(current.getKey());
+                        File tempFile = runContext.workingDir().resolve(Path.of(finalPath)).toFile();
+                        new File(tempFile.getParent()).mkdirs();
 
-                    IOUtils.copy(inputStream, fileOutputStream);
-                    fileOutputStream.flush();
-                    fileOutputStream.close();
+                        // write to temp file
+                        String render = runContext.render(current.getValue().toString());
+                        OutputStream fileOutputStream = new BufferedOutputStream(new FileOutputStream(tempFile));
+                        InputStream inputStream = URIFetcher.of(URI.create(render)).fetch(runContext);
 
-                    // create archive entry
-                    ArchiveEntry entry = archiveInputStream.createArchiveEntry(tempFile, finalPath);
-                    archiveInputStream.putArchiveEntry(entry);
+                        IOUtils.copy(inputStream, fileOutputStream);
+                        fileOutputStream.flush();
+                        fileOutputStream.close();
 
-                    // write archive entry
-                    try (InputStream i = Files.newInputStream(tempFile.toPath())) {
-                        IOUtils.copy(i, archiveInputStream);
+                        // create archive entry
+                        ArchiveEntry entry = archiveInputStream.createArchiveEntry(tempFile, finalPath);
+                        archiveInputStream.putArchiveEntry(entry);
+
+                        // write archive entry
+                        try (InputStream i = Files.newInputStream(tempFile.toPath())) {
+                            IOUtils.copy(i, archiveInputStream);
+                        }
+                        archiveInputStream.closeArchiveEntry();
                     }
-                    archiveInputStream.closeArchiveEntry();
-                }
-            }))
-            .blockLast();
+                }))
+                .blockLast();
+        }
 
         archiveInputStream.finish();
+    }
+
+    /**
+     * An item of a directory to archive: its path relative to the directory root and where its content lives.
+     * For files, either {@code localPath} (already on the working directory) or {@code storageUri} (to fetch from
+     * Kestra's internal storage) is set; neither is for directories.
+     */
+    private record DirectoryItem(String name, boolean directory, Path localPath, URI storageUri) {
+    }
+
+    private void writeDirectory(RunContext runContext, ArchiveOutputStream archive, String directory) throws Exception {
+        boolean directoriesSupported = runContext.render(this.algorithm).as(ArchiveAlgorithm.class).orElseThrow() != ArchiveAlgorithm.AR;
+
+        List<DirectoryItem> items = this.listDirectory(runContext, directory);
+        items.sort(Comparator.comparing(DirectoryItem::name));
+
+        for (DirectoryItem item : items) {
+            if (item.directory()) {
+                if (directoriesSupported) {
+                    // the entry factories read the type from a real directory, whose name does not matter
+                    Path tempDir = Files.createTempDirectory(runContext.workingDir().path(), "dir");
+                    try {
+                        archive.putArchiveEntry(archive.createArchiveEntry(tempDir.toFile(), item.name() + "/"));
+                        archive.closeArchiveEntry();
+                    } finally {
+                        Files.deleteIfExists(tempDir);
+                    }
+                }
+                continue;
+            }
+
+            Path file = item.localPath();
+            boolean temporary = file == null;
+            if (temporary) {
+                file = runContext.workingDir().createTempFile();
+                try (InputStream in = runContext.storage().getFile(item.storageUri())) {
+                    Files.copy(in, file, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+
+            try {
+                archive.putArchiveEntry(archive.createArchiveEntry(file.toFile(), item.name()));
+                try (InputStream in = Files.newInputStream(file)) {
+                    IOUtils.copy(in, archive);
+                }
+                archive.closeArchiveEntry();
+            } finally {
+                if (temporary) {
+                    Files.deleteIfExists(file);
+                }
+            }
+        }
+    }
+
+    private List<DirectoryItem> listDirectory(RunContext runContext, String directory) throws Exception {
+        URI uri = URI.create(directory);
+        String scheme = uri.getScheme();
+
+        if (Namespace.NAMESPACE_FILE_SCHEME.equals(scheme)) {
+            return this.listNamespaceDirectory(runContext, uri.getAuthority(), uri.getPath());
+        } else if (StorageContext.KESTRA_SCHEME.equals(scheme)) {
+            // namespace files are versioned, their storage layout (old revisions, deleted files) must not be listed as is
+            Matcher namespaceFiles = NAMESPACE_FILES_PATH.matcher(uri.getPath() == null ? "" : uri.getPath());
+            if (namespaceFiles.matches()) {
+                return this.listNamespaceDirectory(runContext, namespaceFiles.group(1).replace('/', '.'), "/" + Objects.toString(namespaceFiles.group(2), ""));
+            }
+
+            List<DirectoryItem> items = new ArrayList<>();
+            this.listStorageDirectory(runContext, uri, "", items);
+            return items;
+        } else if (scheme != null && scheme.length() > 1) {
+            // a one letter scheme is a Windows drive letter, anything else is not a supported location
+            throw new IllegalArgumentException("Scheme not supported: " + scheme + ". `fromDirectory` supports `nsfile://`, `kestra://` and working directory paths");
+        }
+
+        return this.listWorkingDirectory(runContext, directory);
+    }
+
+    private List<DirectoryItem> listNamespaceDirectory(RunContext runContext, String namespaceName, String path) throws Exception {
+        var namespace = namespaceName == null ? runContext.storage().namespace() : runContext.storage().namespace(namespaceName);
+        String root = path == null || path.isEmpty() ? "/" : path;
+        String prefix = root.endsWith("/") ? root : root + "/";
+
+        List<DirectoryItem> items = new ArrayList<>();
+        for (NamespaceFileMetadata child : namespace.children(prefix, true)) {
+            String childPath = child.getPath();
+            if (!childPath.startsWith(prefix) || childPath.length() == prefix.length()) {
+                continue;
+            }
+
+            if (child.isDirectory()) {
+                items.add(new DirectoryItem(childPath.substring(prefix.length(), childPath.length() - 1), true, null, null));
+            } else {
+                items.add(new DirectoryItem(childPath.substring(prefix.length()), false, null, namespace.get(Path.of(childPath)).uri()));
+            }
+        }
+
+        return items;
+    }
+
+    private void listStorageDirectory(RunContext runContext, URI directory, String relative, List<DirectoryItem> items) throws Exception {
+        String base = directory.getPath().endsWith("/") ? directory.getPath() : directory.getPath() + "/";
+
+        for (FileAttributes attributes : runContext.storage().list(directory)) {
+            String name = relative + attributes.getFileName();
+            URI child = URI.create(StorageContext.KESTRA_SCHEME + "://" + base).resolve(new URI(null, null, attributes.getFileName(), null).getRawPath());
+
+            if (attributes.getType() == FileAttributes.FileType.Directory) {
+                items.add(new DirectoryItem(name, true, null, null));
+                this.listStorageDirectory(runContext, URI.create(child + "/"), name + "/", items);
+            } else {
+                items.add(new DirectoryItem(name, false, null, child));
+            }
+        }
+    }
+
+    private List<DirectoryItem> listWorkingDirectory(RunContext runContext, String directory) throws IOException {
+        // resolve() rejects paths escaping the working directory
+        Path root = runContext.workingDir().resolve(Path.of(directory));
+        if (!Files.isDirectory(root)) {
+            throw new IllegalArgumentException("Directory not found in the working directory: " + directory);
+        }
+
+        List<DirectoryItem> items = new ArrayList<>();
+        try (Stream<Path> walk = Files.walk(root)) {
+            for (Path path : (Iterable<Path>) walk::iterator) {
+                if (path.equals(root)) {
+                    continue;
+                }
+
+                String name = root.relativize(path).toString().replace(File.separatorChar, '/');
+                if (Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+                    items.add(new DirectoryItem(name, true, null, null));
+                } else if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                    items.add(new DirectoryItem(name, false, path, null));
+                }
+            }
+        }
+
+        return items;
     }
 
     @Builder
